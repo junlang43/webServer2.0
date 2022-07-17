@@ -1,4 +1,7 @@
 #include "task.h"
+#define LF                  (u_char) '\n'
+#define CR                  (u_char) '\r'
+#define CRLF                "\r\n"
 
 void removefd( int epollfd, int fd ) {
     epoll_ctl( epollfd, EPOLL_CTL_DEL, fd, 0 );
@@ -69,8 +72,69 @@ const char *get_file_type(const char *name)
         return "application/ogg";
     if (strcmp(dot, ".pac") == 0)
         return "application/x-ns-proxy-autoconfig";
-
+    if (strcmp(dot, ".zip") ==0 || strcmp(dot, ".rar") == 0)
+        return "application/octet-stream";
     return "text/plain; charset=utf-8";
+}
+static void parse_request_header(char *data, request_header_t *header)
+{
+#define move_next_line(x)   while (*x && *(x + 1) && *x != CR && *(x + 1) != LF) x++;
+#define next_header_line(x) while (*x && *(x + 1) && *x != CR && *(x + 1) != LF) x++; *x=0;
+#define next_header_word(x) while (*x && *x != ' ' && *x != ':' && *(x + 1) && *x != CR && *(x + 1) != LF) x++; *x=0;
+
+    char *p = data;
+    char *q;
+    int idx = 0;
+
+    memset(header, 0, sizeof(request_header_t));
+    // method
+    next_header_word(p);
+    header->method = data;
+    // uri
+    data = ++p;
+    next_header_word(p);
+    header->uri = data;
+    // version
+    data = ++p;
+    next_header_word(p);
+    header->version = data;
+    // goto fields data
+    next_header_line(p);
+    data = ++p + 1;
+    p++;
+    // fields_count
+    q = p;
+    while (*p)
+    {
+        move_next_line(p);
+        data = ++p + 1;
+        p++;
+        header->fields_count++;
+        if (*data && *(data + 1) && *data == CR && *(data + 1) == LF)
+            break;
+    }
+    // malloc fields
+    header->fields = (request_fields_t*)malloc(sizeof(request_fields_t)*header->fields_count);
+    // set fields
+    data = p = q;
+    while (*p)
+    {
+        next_header_word(p);
+        header->fields[idx].key = data;
+        data = ++p;
+        if (*data == ' ')
+        {
+            data++;
+            p++;
+        }
+        next_header_line(p);
+        header->fields[idx++].value = data;
+        data = ++p + 1;
+        p++;
+        if (*data && *(data + 1) && *data == CR && *(data + 1) == LF)
+            break;
+    }
+    assert(idx == header->fields_count);
 }
 
 void Task::doit() {
@@ -96,7 +160,14 @@ void Task::doit() {
         if( !strcmp( method, "GET" ) ) {  // 为GET
             deal_get( uri, start );
         } else if( !strcmp( method, "POST" ) ) {  // 为POST
-            deal_post( uri, buf );
+            request_header_t header;
+            parse_request_header(buf, &header);
+            //printf("%s\n",header.uri);
+            //printf("%d\n",header.fields_count);
+            //for(int i=0;i<header.fields_count;i++){
+                //printf("%s:%s\n",header.fields[i].key,header.fields[i].value);
+            //}
+            deal_postfile(header, buf);
         } else {
             const char *header = "HTTP/1.1 501 Not Implemented\r\nContent-Type: text/plain;charset=utf-8\r\n\r\n";
             send( accp_fd, header, strlen(header), 0 );
@@ -123,32 +194,83 @@ void Task::deal_get( const string & uri, int start ) {
 	else { 
         if(S_ISDIR(st.st_mode))
             send_dir(filename, get_file_type(".html"));
-        else if(S_ISREG(st.st_mode))
+        else if(S_ISREG(st.st_mode)){
 		    send_file(filename, get_file_type(filename.c_str()), start);
+        }
 	}
 }
 
-void Task::deal_post( const string & uri, char *buf ) {
-    string filename = uri.substr(1);
-    if( uri.find( "adder" ) != string::npos ) {  //使用CGI服务器，进行加法运算
-        char *tmp = buf;
-        int len, a, b;
-        char *l = strstr( tmp, "Content-Length:" );  // 获取请求报文主体大小
-        sscanf( l, "Content-Length: %d", &len );
-        len = strlen( tmp ) - len;
-        tmp += len;
-        sscanf( tmp, "a=%d&b=%d", &a, &b );
-        sprintf(tmp, "%d+%d,%d", a, b, accp_fd);  // tmp存储发送到CGI服务器的参数
-
-        // fork产生子进程，执行CGI服务器进行计算（webServer一眼只进行解析、发送数据，不进行相关计算）
-        if( fork() == 0 ) {
-            // dup2( accp_fd, STDOUT_FILENO );
-            execl( filename.c_str(), tmp, NULL );
+void Task::deal_postfile( const request_header_t header, char* buf) {
+    string sfilename="/home/langjun/exercise/IOtest/mycp.c";
+    char filepath[1024];
+    memcpy(filepath, header.uri+strlen("/upload?path="),strlen(header.uri)-strlen("/upload?path="));
+    char boundary[64];
+    char *temp = NULL;
+    int content_length=0;
+    for (int i=0; i<header.fields_count; i++)
+    {
+        if (0 == strcmp(header.fields[i].key, "Content-Length"))
+        {
+            content_length = atoi(header.fields[i].value);
+            break;
         }
-        wait( NULL );  // 等待子进程结束
-    } else {
-        send_file( "html/404.html", "text/html", 0, 404, "Not Found" );
     }
+    if (content_length == 0){
+        const char *header = "HTTP/1.1 501 Not Implemented\r\nContent-Type: text/plain;charset=utf-8\r\n\r\n";
+        send( accp_fd, header, strlen(header), 0 );
+        return;
+    }
+    
+    //get boundary
+    for (int i=0; i<header.fields_count; i++)
+    {
+        if (0 == strcmp(header.fields[i].key, "Content-Type"))
+        {
+            temp = strstr(header.fields[i].value, "boundary=");
+            if (temp)
+            {
+                temp += strlen("boundary=");
+                memcpy(boundary, temp, strlen(temp));
+            }
+            break;
+        }
+    }
+
+    FILE* pFile=fopen(sfilename.c_str(),"r");
+    long  nFileLen=0;
+    fseek(pFile, 0, SEEK_END);
+    nFileLen=ftell(pFile);
+    fseek(pFile, 0, SEEK_SET);
+    char* sFileText=new char[nFileLen+1];
+    memset(sFileText, 0, nFileLen+1);
+    fread(sFileText, 1, nFileLen, pFile);
+    fclose(pFile);
+
+    char body[96*1024] = {0};
+    sprintf(body,"%s\r\n",boundary);
+    sprintf(body+strlen(body),"Content-Disposition: form-data;filename=\"%s\"\r\n",sfilename.c_str());
+    sprintf(body+strlen(body),"Content-Type: application/octet-stream\r\n\r\n");
+    sprintf(body+strlen(body),"%s\r\n",sFileText);
+    sprintf(body+strlen(body),"%s--\r\n",boundary);
+
+    char Buf[128*1024]={0};
+    sprintf(Buf,"%s%s%s\r\n",header.method, header.uri, header.version);
+    for(int i=0;i<header.fields_count;i++){
+        sprintf(Buf+strlen(Buf),"%s:%s\r\n",header.fields[i].key, header.fields[i].value);
+    }
+    sprintf(Buf+strlen(Buf), "%s", body);
+    printf("%s\n", Buf);
+
+    send(accp_fd,Buf,strlen(Buf),0);
+
+    char res[1024];
+    int ret=recv(accp_fd, res, 1024, 0);
+    if(ret>0){
+        printf("%s\n",res);
+    }else{
+        printf("failed\n");
+    }
+
 }
 
 void Task::send_dir(const string & filename, const char *type, const int num, const char *info) {
@@ -164,7 +286,10 @@ void Task::send_dir(const string & filename, const char *type, const int num, co
 	char buf[4094] = { 0 };
 
 	sprintf(buf, "<html><head><title>目录名: %s</title></head>", filename.c_str());
-	sprintf(buf + strlen(buf), "<body><h1>当前目录: %s</h1><table>", filename.c_str());
+    sprintf(buf + strlen(buf), "<body><form action=\"/upload?path=%s\" method=\"post\" enctype=\"multipart/form-data\">\r\n", filename.c_str());
+    sprintf(buf + strlen(buf), "<input type=\"file\" name=\"file\" multiple=\"multiple\" />\r\n");
+    sprintf(buf + strlen(buf), "<input type=\"submit\" value=\"Upload\" /></form><hr><pre>\r\n");
+    sprintf(buf + strlen(buf), "<h1>当前目录: %s</h1><table>", filename.c_str());
 
 	char enstr[1024] = { 0 };
 	char path[1024] = { 0 };
